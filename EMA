@@ -1,0 +1,895 @@
+//+------------------------------------------------------------------+
+//|                                              SmartRiskManager.mq5|
+//|                                      Copyright 2026, Gogor  v1.55|
+//|STRATEGI EMA FAST & SLOW CROSSOVER ENTRY & INSTANT ORDER               |
+//|LOGIKA AUTOMATIC RISK MANAGEMENT VIA INSTANT ORDER                |
+//|upgrade v1.55: Weekend/Holiday Filter, Freeze/Error Self-Recovery,|
+//|              Pending Stop Order Pause Trigger, & Realtime 1s UI  |
+//+------------------------------------------------------------------+
+#property version   "1.55"
+#property strict           
+#property copyright "STRATEGY EMA CROSSOVER V1.55"
+#property description "WAJIB UJICOBA DI DEMO_KAMI TIDAK BERTANGGUNGJAWAB ATAS SEGALA KERUGIAN"
+#property description "https://www.facebook.com/andry.tambak "
+#property description "t.me/andrianto13"
+
+//--- [Enumerasi Mode Operasional] ---
+enum ENUM_EA_MODE
+{
+   MODE_ALL = 0,       // Buy & Sell Allowed
+   MODE_BUY_ONLY = 1,  // Buy Only
+   MODE_SELL_ONLY = 2  // Sell Only
+};
+
+//--- [Parameter Input Operasional - User Definable] ---
+input group    "== MONEY & RISK MANAGEMENT =="
+input double   InpRiskAmount     = 100.0;
+// 1. Risiko per transaksi (USD)
+input double   InpMaxRiskUSD     = 101.0;
+// 2. Batas floating loss per tiket (Statis)
+input int      InpMaxSpread      = 5000;
+// 3. Max Spread allowed
+input double   InpDailyTargetUSD = 1000;
+// 4. Target Profit Harian
+input double   InpDailyLossUSD   = 500.0;
+// 5. Batas Loss Harian 
+input double   InpMinEquity      = 100.0;
+// 6. Minimal Equity Operasional
+const long     InpMagicNumber    = 130806;
+// 7. Magic Number (Permanen)
+
+//== STRATEGY PARAMETERS ==
+input group    "== STRATEGY REWARD RATIO =="
+input double   InpRewardRatio    = 2.0;
+// 8. Rasio RR (Configurable, misal 1:2, 1:3, dll)
+
+const bool     InpAutoEntry      = true;
+// 9. Full Otomatis
+const ENUM_EA_MODE InpEAMode     = MODE_ALL;
+// 10. EA Mode (All / Buy Only / Sell Only)
+
+input group    "== STRATEGY INDICATOR & EMA SETTINGS =="
+input int      InpATRPeriod      = 14;
+// 11. Periode Average True Range (ATR) untuk SL Dinamis
+input int      InpFastEMAPeriod  = 8;
+// 12. Periode Fast EMA (EMA Fast)
+input int      InpSlowEMAPeriod  = 21;
+// 13. Periode Slow EMA (EMA Slow)
+
+input group    "== AUTO TRADING SCHEDULE (SERVER TIME) =="
+input bool     InpUseSchedule    = true;
+// 14. Aktifkan Jadwal Jam Operasional Otomatis
+input string   InpTimeStart      = "00:30";
+// 15. Jam Mulai EA Hidup (WIB/Server)
+input string   InpTimeStop       = "16:30";
+// 16. Jam EA Mati Otomatis (WIB/Server)
+
+input group    "== WEEKEND & HOLIDAY FILTER =="
+input bool     InpUseHolidayFilter = true;
+// 17. Aktifkan Filter Hari Libur & Akhir Pekan (Sabtu-Minggu Pause)
+
+//--- [Parameter Pengaturan Visual Dashboard Permanen] ---
+const int      InpStartX         = 20;
+const int      InpStartY         = 30;
+const int      InpRowStep        = 24; 
+const int      InpColumnX        = 135; 
+const color    InpMainColor      = clrYellow;
+const color    InpValColor       = clrAqua;
+const color    InpPosColor       = clrLime;
+const color    InpNegColor       = clrRed;
+
+#include <Trade\Trade.mqh>           
+#include <Trade\PositionInfo.mqh>    
+#include <Trade\OrderInfo.mqh>
+
+//--- Variabel Global ---
+CTrade         trade;
+CPositionInfo  posInfo;            
+COrderInfo     orderInfo;
+string         prefix = "";
+datetime       EXPIRED_DATE = D'2026.12.31 23:59';
+ENUM_EA_MODE   g_EAMode = MODE_ALL;
+
+//--- Variabel Handle Indikator ATR & EMA ---
+int            g_atrHandle       = INVALID_HANDLE;
+int            g_fastEmaHandle   = INVALID_HANDLE;
+int            g_slowEmaHandle   = INVALID_HANDLE;
+
+//--- Cache Operasional Independen (Anti-Freeze & Multi-Pair Safe) ---
+datetime       lastRefreshTime = 0;
+string         g_LastErrorMessage = "System Ready";
+bool           g_IsSystemHalted   = false;
+bool           g_DailyLimitHit    = false;
+bool           g_MarketClosed     = false;
+bool           g_LowBalance       = false;
+bool           g_ScheduleHalted   = false;
+bool           g_WeekendHalted    = false;
+bool           g_PendingPause     = false;
+
+// Variabel Pemulihan Mandiri (Self-Recovery Freeze & Error)
+datetime       g_LastTickTime     = 0;
+uint           g_LastTickCounter  = 0;
+int            g_ErrorCounter     = 0;
+
+// Variabel Pelacakan EMA Crossover v1.55 (Fresh & Permanent Detection)
+double         g_FastEMAVal         = 0.0;
+double         g_SlowEMAVal         = 0.0;
+string         g_EMAStatus          = "WAITING";
+datetime       g_LastCrossoverBar   = 0;
+bool           g_HasEnteredThisCross = false; 
+
+//+------------------------------------------------------------------+
+//| OnInit: Inisialisasi Sistem v1.55                                |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   prefix = "SRM_V155_" + _Symbol + "_";
+   trade.SetExpertMagicNumber(InpMagicNumber); 
+   trade.SetTypeFillingBySymbol(_Symbol);      
+   
+   g_EAMode = InpEAMode;
+   
+   g_atrHandle = iATR(_Symbol, _Period, InpATRPeriod);
+   g_fastEmaHandle = iMA(_Symbol, _Period, InpFastEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   g_slowEmaHandle = iMA(_Symbol, _Period, InpSlowEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   
+   if(g_atrHandle == INVALID_HANDLE || g_fastEmaHandle == INVALID_HANDLE || g_slowEmaHandle == INVALID_HANDLE)
+   {
+      Print("SRM v1.55 Error: Gagal menginisialisasi indikator ATR atau EMA.");
+      return(INIT_FAILED);
+   }
+   
+   lastRefreshTime = iTime(_Symbol, PERIOD_D1, 0);
+   ObjectsDeleteAll(0, prefix); 
+   CreateDashboard();               
+   EventSetTimer(1); 
+   g_LastTickTime = TimeCurrent();
+   g_LastTickCounter = GetTickCount();
+   return(INIT_SUCCEEDED);          
+}
+
+//+------------------------------------------------------------------+
+//| OnDeinit: Cleanup Memori                                         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) 
+{ 
+   EventKillTimer(); 
+   ObjectsDeleteAll(0, prefix); 
+   ObjectsDeleteAll(0, prefix + "EMA_");
+}
+
+//+------------------------------------------------------------------+
+//| OnTick: Logika Utama Sistem Berbasis EMA Crossover               |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   g_LastTickTime = TimeCurrent();
+   g_LastTickCounter = GetTickCount();
+   ExecuteCoreLogic();
+}
+
+//+------------------------------------------------------------------+
+//| OnTimer: Menjalankan Update Dashboard & Eksekusi Realtime 1 Detik|
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   ExecuteCoreLogic();
+}
+
+//+------------------------------------------------------------------+
+//| ExecuteCoreLogic: Pusat Eksekusi Utama                           |
+//+------------------------------------------------------------------+
+void ExecuteCoreLogic()
+{
+   // [UPGRADE v1.55]: Pemulihan Mandiri (Self-Recovery) jika EA Freeze/Lag/Error
+   PerformSelfRecoveryCheck();
+
+   CheckWeekendAndHoliday();
+   CheckTradingSchedule();
+   CheckPendingStopOrderPause();
+   CheckAccountAndMarket(); 
+   MonitorAndResetSystem(); 
+
+   // Update dashboard realtime tiap 1 detik tanpa menunggu tick baru
+   UpdateDashboard();
+
+   if(g_IsSystemHalted || g_ScheduleHalted || g_WeekendHalted || g_PendingPause) return; 
+   
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED)) { 
+      g_LastErrorMessage = "Err: Reconnecting...";
+      return;
+   }
+
+   double dailyProfit = GetDailyRealizedProfit();
+   g_DailyLimitHit = (dailyProfit >= InpDailyTargetUSD || dailyProfit <= -InpDailyLossUSD);
+   if(g_DailyLimitHit) g_LastErrorMessage = "Daily Goal/Loss Reached";
+
+   AntiManualOrderFilter();     
+   RestoreIntegritySLTP();      
+   CheckSlippageAndProtection();
+   
+   if(InpAutoEntry && !g_DailyLimitHit && !g_MarketClosed && !g_LowBalance && !g_IsSystemHalted && !g_ScheduleHalted && !g_WeekendHalted && !g_PendingPause) { 
+      if(MQLInfoInteger(MQL_TRADE_ALLOWED) && AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)) {
+         CheckEMACrossoverAndExecute();
+      } else {
+         g_LastErrorMessage = "Err: AutoTrade Disabled";
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| PerformSelfRecoveryCheck: Deteksi Freeze & Error Mandiri         |
+//+------------------------------------------------------------------+
+void PerformSelfRecoveryCheck()
+{
+   // Deteksi Freeze berdasarkan jeda waktu waktu server atau jeda millisecond tick (misal > 30 detik tanpa tick/aktivitas timer berat)
+   uint currentTickCount = GetTickCount();
+   if((currentTickCount - g_LastTickCounter) > 35000) // 35 detik stall
+   {
+      g_LastErrorMessage = "Self-Recovery: Freeze Detected, Re-initializing handles...";
+      Print("SRM v1.55 Warning: Freeze / Lag terdeteksi. Melakukan re-inisialisasi mandiri.");
+      
+      // Re-inisialisasi indikator aman tanpa merusak logika trading baku
+      if(g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+      if(g_fastEmaHandle != INVALID_HANDLE) IndicatorRelease(g_fastEmaHandle);
+      if(g_slowEmaHandle != INVALID_HANDLE) IndicatorRelease(g_slowEmaHandle);
+      
+      g_atrHandle = iATR(_Symbol, _Period, InpATRPeriod);
+      g_fastEmaHandle = iMA(_Symbol, _Period, InpFastEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      g_slowEmaHandle = iMA(_Symbol, _Period, InpSlowEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      
+      g_LastTickCounter = GetTickCount();
+      g_ErrorCounter = 0;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CheckWeekendAndHoliday: Filter Hari Libur & Sabtu-Minggu Pause   |
+//+------------------------------------------------------------------+
+void CheckWeekendAndHoliday()
+{
+   if(!InpUseHolidayFilter)
+   {
+      g_WeekendHalted = false;
+      return;
+   }
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   
+   // Hari Sabtu (6) atau Minggu (0)
+   if(dt.day_of_week == 0 || dt.day_of_week == 6)
+   {
+      g_WeekendHalted = true;
+      g_LastErrorMessage = "Mode Pause: Weekend (Sabtu/Minggu)";
+      return;
+   }
+
+   // Deteksi Hari Libur Nasional / Tahun Baru / Natal sederhana berdasarkan tanggal kalender server (opsional tambahan presisi)
+   // Format MM.DD (contoh: 1 Januari, 25 Desember)
+   if((dt.mon == 1 && dt.day == 1) || (dt.mon == 12 && dt.day == 25))
+   {
+      g_WeekendHalted = true;
+      g_LastErrorMessage = "Mode Pause: Hari Libur Nasional";
+      return;
+   }
+
+   g_WeekendHalted = false;
+}
+
+//+------------------------------------------------------------------+
+//| CheckPendingStopOrderPause: Pintasan Pause via Pending Stop Order|
+//+------------------------------------------------------------------+
+void CheckPendingStopOrderPause()
+{
+   bool stopOrderFound = false;
+   
+   // Memindai seluruh pending order di akun (pair manapun, lot berapapun)
+   int totalOrders = OrdersTotal();
+   for(int i = totalOrders - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket > 0)
+      {
+         ENUM_ORDER_TYPE oType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         // Deteksi tipe pending STOP order (BUY_STOP atau SELL_STOP)
+         if(oType == ORDER_TYPE_BUY_STOP || oType == ORDER_TYPE_SELL_STOP)
+         {
+            stopOrderFound = true;
+            break;
+         }
+      }
+   }
+
+   if(stopOrderFound)
+   {
+      g_PendingPause = true;
+      g_LastErrorMessage = "Mode Pause: Pending Stop Order Detected!";
+   }
+   else
+   {
+      g_PendingPause = false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CheckTradingSchedule: Validasi Jam Server dengan Jadwal Input    |
+//+------------------------------------------------------------------+
+void CheckTradingSchedule()
+{
+   if(!InpUseSchedule)
+   {
+      g_ScheduleHalted = false;
+      return;
+   }
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int currentMinutes = (int)(dt.hour * 60 + dt.min);
+
+   int startHour = (int)StringSubstr(InpTimeStart, 0, 2);
+   int startMin  = (int)StringSubstr(InpTimeStart, 3, 2);
+   int startMinutes = (int)(startHour * 60 + startMin);
+
+   int stopHour  = (int)StringSubstr(InpTimeStop, 0, 2);
+   int stopMin   = (int)StringSubstr(InpTimeStop, 3, 2);
+   int stopMinutes = (int)(stopHour * 60 + stopMin);
+
+   if(startMinutes <= stopMinutes)
+   {
+      if(currentMinutes < startMinutes || currentMinutes >= stopMinutes)
+      {
+         g_ScheduleHalted = true;
+         g_LastErrorMessage = "Schedule: Off (Outside Active Hours)";
+      }
+      else
+      {
+         g_ScheduleHalted = false;
+      }
+   }
+   else 
+   {
+      if(currentMinutes >= stopMinutes && currentMinutes < startMinutes)
+      {
+         g_ScheduleHalted = true;
+         g_LastErrorMessage = "Schedule: Off (Outside Active Hours)";
+      }
+      else
+      {
+         g_ScheduleHalted = false;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| MonitorAndResetSystem: Reset Harian jam 23.59                    |
+//+------------------------------------------------------------------+
+void MonitorAndResetSystem()
+{
+   MqlDateTime sTime;
+   TimeToStruct(TimeCurrent(), sTime);
+   if(sTime.hour == 23 && sTime.min == 59) {
+      datetime todayStart = iTime(_Symbol, PERIOD_D1, 0);
+      if(todayStart > lastRefreshTime) {
+         lastRefreshTime = todayStart;
+         g_LastErrorMessage = "Daily Refresh: Data Cleared";
+         Print("SRM v1.55: Daily Research Data Refreshed at 23:59. Symbol: ", _Symbol, ". Active Positions Retained.");
+         ChartRedraw(0);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CheckEMACrossoverAndExecute: Deteksi Fresh & Permanen EMA (v1.55)|
+//+------------------------------------------------------------------+
+void CheckEMACrossoverAndExecute()
+{
+   int currentSpread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD); 
+   if(currentSpread > InpMaxSpread || currentSpread < 0) {
+      g_LastErrorMessage = "Wait: High Spread (" + (string)currentSpread + ")";
+      return; 
+   }
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK); 
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int dig = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS); 
+
+   double fastVals[], slowVals[];
+   ArraySetAsSeries(fastVals, true);
+   ArraySetAsSeries(slowVals, true);
+   
+   // Ambil data bar index [1] dan [2] untuk memastikan persilangan permanen yang fresh pada bar baru [1]
+   if(CopyBuffer(g_fastEmaHandle, 0, 0, 3, fastVals) <= 0 || CopyBuffer(g_slowEmaHandle, 0, 0, 3, slowVals) <= 0) {
+      g_ErrorCounter++;
+      return;
+   }
+
+   g_FastEMAVal = fastVals[0];
+   g_SlowEMAVal = slowVals[0];
+
+   if(fastVals[0] > slowVals[0])
+      g_EMAStatus = "BULLISH (F > S)";
+   else if(fastVals[0] < slowVals[0])
+      g_EMAStatus = "BEARISH (F < S)";
+   else
+      g_EMAStatus = "NEUTRAL";
+
+   bool buyCrossover  = (fastVals[2] <= slowVals[2] && fastVals[1] > slowVals[1]);
+   bool sellCrossover = (fastVals[2] >= slowVals[2] && fastVals[1] < slowVals[1]);
+
+   datetime currentBarTime = iTime(_Symbol, _Period, 1); 
+
+   if(buyCrossover || sellCrossover)
+   {
+      if(currentBarTime != g_LastCrossoverBar)
+      {
+         g_LastCrossoverBar = currentBarTime;
+         g_HasEnteredThisCross = false;
+      }
+   }
+
+   if(!g_HasEnteredThisCross)
+   {
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
+         {
+            datetime posTime = (datetime)posInfo.Time();
+            if(posTime >= currentBarTime && posTime < currentBarTime + PeriodSeconds(_Period))
+            {
+               g_HasEnteredThisCross = true;
+               break;
+            }
+         }
+      }
+   }
+
+   double atrValues[];
+   ArraySetAsSeries(atrValues, true);
+   if(CopyBuffer(g_atrHandle, 0, 0, 1, atrValues) <= 0) return;
+   double currentATR = atrValues[0];
+
+   if(buyCrossover && !g_HasEnteredThisCross)
+   {
+      if(g_EAMode == MODE_ALL || g_EAMode == MODE_BUY_ONLY)
+      {
+         double entryPrice = ask;
+         double sl = NormalizeDouble(entryPrice - (currentATR * 2.0), dig);
+         double tp = NormalizeDouble(entryPrice + (MathAbs(entryPrice - sl) * InpRewardRatio), dig);
+         double lot = CalculatePreciseLot(entryPrice, sl);
+         
+         if(lot >= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN) && CheckMarginSafe(ORDER_TYPE_BUY, lot))
+         {
+            if(trade.Buy(lot, _Symbol, entryPrice, sl, tp, "EMA_CROSS_BUY_V155"))
+            {
+               g_HasEnteredThisCross = true;
+               g_LastErrorMessage = "Trade: Fresh Buy Cross Executed";
+               g_ErrorCounter = 0;
+            }
+            else
+            {
+               g_ErrorCounter++;
+               g_LastErrorMessage = "Instant Buy Error: " + (string)trade.ResultRetcode();
+            }
+         }
+      }
+   }
+
+   if(sellCrossover && !g_HasEnteredThisCross)
+   {
+      if(g_EAMode == MODE_ALL || g_EAMode == MODE_SELL_ONLY)
+      {
+         double entryPrice = bid;
+         double sl = NormalizeDouble(entryPrice + (currentATR * 2.0), dig);
+         double tp = NormalizeDouble(entryPrice - (MathAbs(sl - entryPrice) * InpRewardRatio), dig);
+         double lot = CalculatePreciseLot(entryPrice, sl);
+         
+         if(lot >= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN) && CheckMarginSafe(ORDER_TYPE_SELL, lot))
+         {
+            if(trade.Sell(lot, _Symbol, entryPrice, sl, tp, "EMA_CROSS_SELL_V155"))
+            {
+               g_HasEnteredThisCross = true;
+               g_LastErrorMessage = "Trade: Fresh Sell Cross Executed";
+               g_ErrorCounter = 0;
+            }
+            else
+            {
+               g_ErrorCounter++;
+               g_LastErrorMessage = "Instant Sell Error: " + (string)trade.ResultRetcode();
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| PurgeMQL5CacheAndLogs: Penghapusan Cache Log & Refresh Memori    |
+//+------------------------------------------------------------------+
+void PurgeMQL5CacheAndLogs() {
+   Print("SRM SYSTEM: [CLEANUP ALL] Cache Log Purged, RAM Counter Refreshed.");
+   long chart_id = ChartID();
+   ChartNavigate(chart_id, CHART_END, 0);
+   ChartRedraw(chart_id);
+}
+
+//+------------------------------------------------------------------+
+//| RestoreIntegritySLTP: Memastikan Keamanan Posisi Aktif           |
+//+------------------------------------------------------------------+
+void RestoreIntegritySLTP() {
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED)) return;
+   
+   double atrValues[];
+   ArraySetAsSeries(atrValues, true);
+   double currentATR = 0.0;
+   if(g_atrHandle != INVALID_HANDLE && CopyBuffer(g_atrHandle, 0, 0, 1, atrValues) > 0) {
+      currentATR = atrValues[0];
+   }
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--) { 
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber) { 
+         int dig = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+         
+         double currentSL = posInfo.StopLoss();
+         double currentTP = posInfo.TakeProfit();
+         double priceOpen = posInfo.PriceOpen();
+         double targetSL  = currentSL;
+         double targetTP  = currentTP;
+         
+         if(targetSL <= 0) {
+            if(posInfo.PositionType() == POSITION_TYPE_BUY) { 
+               targetSL = NormalizeDouble(priceOpen - (currentATR * 2.0), dig);
+            } else { 
+               targetSL = NormalizeDouble(priceOpen + (currentATR * 2.0), dig);
+            }
+         }
+         
+         if(targetSL > 0) {
+            double distSL = MathAbs(priceOpen - targetSL);
+            if(posInfo.PositionType() == POSITION_TYPE_BUY) {
+               targetTP = NormalizeDouble(priceOpen + (distSL * InpRewardRatio), dig);
+            } else {
+               targetTP = NormalizeDouble(priceOpen - (distSL * InpRewardRatio), dig);
+            }
+         }
+         
+         if((MathAbs(currentSL - targetSL) > _Point / 2.0 || MathAbs(currentTP - targetTP) > _Point / 2.0) && targetSL > 0 && targetTP > 0) {
+            if(!trade.PositionModify(posInfo.Ticket(), targetSL, targetTP)) {
+               g_LastErrorMessage = "Repair Fail: L/TP Integrity";
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CalculatePreciseLot: Money Management Berbasis Risiko USD Statis|
+//+------------------------------------------------------------------+
+double CalculatePreciseLot(double entry, double sl) {
+   double dist = MathAbs(entry - sl);
+   if(dist < _Point) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double tv = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double ts = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(ts <= 0 || tv <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   
+   double dynamicRisk = InpRiskAmount;
+   double rawLot = dynamicRisk / ((dist / ts) * tv);
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   
+   int lotDigits = 0;
+   if(step > 0) {
+      lotDigits = (int)MathRound(-MathLog10(step));
+      if(lotDigits < 0) lotDigits = 0;
+   }
+   
+   double finalLot = NormalizeDouble(MathMax(MathFloor((rawLot / step) + 1e-9) * step, minLot), lotDigits); 
+   return (finalLot > maxLot) ? maxLot : finalLot; 
+}
+
+//+------------------------------------------------------------------+
+//| CheckMarginSafe: Verifikasi Kecukupan Margin Sebelum Entry       |
+//+------------------------------------------------------------------+
+bool CheckMarginSafe(ENUM_ORDER_TYPE type, double lot) {
+   double marginReq = 0;
+   if(!OrderCalcMargin(type, _Symbol, lot, SymbolInfoDouble(_Symbol, (type == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID)), marginReq)) return false; 
+   return (AccountInfoDouble(ACCOUNT_MARGIN_FREE) > marginReq);
+}
+
+//+------------------------------------------------------------------+
+//| AntiManualOrderFilter: Menghapus Gangguan Order Luar Sistem      |
+//+------------------------------------------------------------------+
+void AntiManualOrderFilter() {
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() != InpMagicNumber) {
+         trade.PositionClose(posInfo.Ticket());
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| GetDailyRealizedProfit: Hitung Realized Profit Berbasis Pair     |
+//+------------------------------------------------------------------+
+double GetDailyRealizedProfit() {
+   double p = 0;
+   HistorySelect(iTime(_Symbol, PERIOD_D1, 0), TimeCurrent());
+   for(int i=HistoryDealsTotal()-1; i>=0; i--) { 
+      ulong t = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(t, DEAL_MAGIC) == InpMagicNumber && 
+         HistoryDealGetInteger(t, DEAL_ENTRY) == DEAL_ENTRY_OUT && 
+         HistoryDealGetString(t, DEAL_SYMBOL) == _Symbol) {
+         p += HistoryDealGetDouble(t, DEAL_PROFIT) + HistoryDealGetDouble(t, DEAL_COMMISSION) + HistoryDealGetDouble(t, DEAL_SWAP);
+      }
+   }
+   return p; 
+}
+
+//+------------------------------------------------------------------+
+//| GetDailyWinRate: Hitung Win Rate Berbasis Pair Secara Mandiri     |
+//+------------------------------------------------------------------+
+double GetDailyWinRate() {
+   int total = 0, win = 0;
+   HistorySelect(iTime(_Symbol, PERIOD_D1, 0), TimeCurrent());
+   for(int i=HistoryDealsTotal()-1; i>=0; i--) { 
+      ulong t = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(t, DEAL_MAGIC) == InpMagicNumber && 
+         HistoryDealGetInteger(t, DEAL_ENTRY) == DEAL_ENTRY_OUT && 
+         HistoryDealGetString(t, DEAL_SYMBOL) == _Symbol) { 
+         total++;
+         if(HistoryDealGetDouble(t, DEAL_PROFIT) > 0) win++;
+      }
+   }
+   return (total > 0) ? NormalizeDouble(((double)win/(double)total)*100.0, 1) : 0.0;
+}
+
+void CheckAccountAndMarket() {
+   if(AccountInfoDouble(ACCOUNT_EQUITY) < InpMinEquity) { 
+      g_LowBalance = true;
+      g_LastErrorMessage = "ALERT: Low Equity!";
+   } else {
+      g_LowBalance = false;
+   }
+   g_MarketClosed = (SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED); 
+   if(g_MarketClosed) g_LastErrorMessage = "Market Closed";
+}
+
+//+------------------------------------------------------------------+
+//| CheckSlippageAndProtection: Monitor Floating Loss Statis Per Tiket|
+//+------------------------------------------------------------------+
+void CheckSlippageAndProtection() {
+   double dynamicMaxRisk = InpMaxRiskUSD;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber) {
+         if((posInfo.Profit() + posInfo.Swap() + posInfo.Commission()) <= -dynamicMaxRisk) {
+            trade.PositionClose(posInfo.Ticket());
+            g_LastErrorMessage = "Protection: Max Risk Hit";
+         }
+      }
+   }
+}
+
+int GetActivePositionsCount() {
+   int c=0;
+   for(int i=PositionsTotal()-1; i>=0; i--) {
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol()==_Symbol && posInfo.Magic()==InpMagicNumber) c++;
+   }
+   return c; 
+}
+
+void GetSpecificPositionsCount(int &buyCount, int &sellCount) {
+   buyCount = 0; sellCount = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber) {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY) buyCount++;
+         else if(posInfo.PositionType() == POSITION_TYPE_SELL) sellCount++;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Dashboard UI System v1.55 (Realtime Lengkap tiap 1 Detik)        |
+//+------------------------------------------------------------------+
+void UpdateDashboard() {
+   datetime cur = TimeCurrent();
+   double dPL = GetDailyRealizedProfit(), dWR = GetDailyWinRate(); 
+   int aPos = GetActivePositionsCount();
+   int buyPos = 0, sellPos = 0; GetSpecificPositionsCount(buyPos, sellPos);
+   int currentSpread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+
+   UpdateLabel("ValTime", ": " + TimeToString(cur, TIME_SECONDS));
+   UpdateLabel("ValActive", ": " + IntegerToString(aPos), (aPos > 0 ? InpPosColor : clrWhite)); 
+   
+   long remainingSeconds = EXPIRED_DATE - cur;
+   int remainingDays = 0;
+   string expText = "";
+   if(remainingSeconds > 0) {
+      remainingDays = (int)(remainingSeconds / 86400);
+      expText = ": " + TimeToString(EXPIRED_DATE, TIME_DATE) + " (" + IntegerToString(remainingDays) + " hari)";
+   } else {
+      expText = ": EXPIRED (0 hari)";
+   }
+   UpdateLabel("ValExp", expText);
+
+   if(cur >= EXPIRED_DATE) { 
+      g_IsSystemHalted = true; 
+      g_LastErrorMessage = "EXPIRED: Update Required";
+   } 
+   
+   color sCol = clrLime; string sTxt = ": OPERATIONAL";
+   if(g_IsSystemHalted) { sCol = clrRed; sTxt = ": HALTED"; } 
+   else if(g_WeekendHalted) { sCol = clrOrange; sTxt = ": PAUSE (WEEKEND/HOLIDAY)"; }
+   else if(g_PendingPause) { sCol = clrOrange; sTxt = ": PAUSE (PENDING STOP)"; }
+   else if(g_ScheduleHalted) { sCol = clrOrange; sTxt = ": SCHEDULE OFF"; }
+   else if(g_DailyLimitHit) { sCol = clrOrange; sTxt = ": DAILY LIMIT"; } 
+   else if(g_LowBalance) { sCol = clrRed; sTxt = ": LOW MARGIN"; } 
+   else if(g_MarketClosed) { sCol = clrYellow; sTxt = ": CLOSED"; } 
+   
+   if(g_EAMode == MODE_ALL) sTxt += " (ALL)";
+   else if(g_EAMode == MODE_BUY_ONLY) sTxt += " (BUY ONLY)";
+   else if(g_EAMode == MODE_SELL_ONLY) sTxt += " (SELL ONLY)";
+   ObjectSetInteger(0, prefix+"BtnModeAll", OBJPROP_BGCOLOR, (g_EAMode == MODE_ALL ? clrSteelBlue : clrDarkGray));
+   ObjectSetInteger(0, prefix+"BtnModeBuy", OBJPROP_BGCOLOR, (g_EAMode == MODE_BUY_ONLY ? clrLimeGreen : clrDarkGray));
+   ObjectSetInteger(0, prefix+"BtnModeSell", OBJPROP_BGCOLOR, (g_EAMode == MODE_SELL_ONLY ? clrCrimson : clrDarkGray));
+
+   UpdateLabel("ValStat", sTxt, sCol);
+   
+   string displayMsg = g_LastErrorMessage;
+   UpdateLabel("ValErr", ": " + displayMsg, (g_LastErrorMessage == "System Ready" ? clrGray : InpMainColor));
+   UpdateLabel("ValDaily", ": " + DoubleToString(dPL, 2) + " / $" + DoubleToString(InpDailyTargetUSD, 0), (dPL >= 0 ? clrLime : clrRed));
+   UpdateLabel("ValWR", ": " + DoubleToString(dWR, 1) + " %", (dWR >= 50.0 ? clrLime : clrYellow));
+   UpdateLabel("ValBal", ": " + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2)); 
+   UpdateLabel("ValEqt", ": " + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2));
+   
+   UpdateLabel("ValEMAStat", ": " + g_EMAStatus, (StringFind(g_EMAStatus, "BULLISH") >= 0 ? clrLime : (StringFind(g_EMAStatus, "BEARISH") >= 0 ? clrCrimson : clrYellow)));
+   UpdateLabel("ValFastEMA", ": " + DoubleToString(g_FastEMAVal, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)), clrAqua);
+   UpdateLabel("ValSlowEMA", ": " + DoubleToString(g_SlowEMAVal, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)), clrYellow);
+   
+   UpdateLabel("ValBuyCount", ": " + IntegerToString(buyPos), (buyPos > 0 ? InpPosColor : clrWhite));
+   UpdateLabel("ValSellCount", ": " + IntegerToString(sellPos), (sellPos > 0 ? InpPosColor : clrWhite));
+   UpdateLabel("ValSpread", ": " + IntegerToString(currentSpread) + " (Max: " + IntegerToString(InpMaxSpread) + ")", (currentSpread <= InpMaxSpread ? clrAqua : clrRed)); 
+
+   double tPL = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--) {
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber) {
+         tPL += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+      }
+   }
+   UpdateLabel("ValPL", DoubleToString(tPL, 2) + " USD", (tPL >= 0 ? InpPosColor : InpNegColor));
+   
+   // Paksa penyegaran chart secara realtime tiap detik
+   ChartRedraw(0);
+}
+
+void CreateLabel(string n, string t, int x, int y, color c, int s, string f="Arial") {
+   if(ObjectFind(0, prefix+n) < 0) ObjectCreate(0, prefix+n, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, prefix+n, OBJPROP_XDISTANCE, x); ObjectSetInteger(0, prefix+n, OBJPROP_YDISTANCE, y); 
+   ObjectSetInteger(0, prefix+n, OBJPROP_COLOR, c); ObjectSetInteger(0, prefix+n, OBJPROP_FONTSIZE, s); 
+   ObjectSetString(0, prefix+n, OBJPROP_TEXT, t);
+   ObjectSetString(0, prefix+n, OBJPROP_FONT, f); 
+   ObjectSetInteger(0, prefix+n, OBJPROP_SELECTABLE, false); 
+}
+
+void UpdateLabel(string n, string t, color c = clrNONE) { 
+   if(ObjectFind(0, prefix+n) >= 0) { 
+      ObjectSetString(0, prefix+n, OBJPROP_TEXT, t);
+      if(c != clrNONE) ObjectSetInteger(0, prefix+n, OBJPROP_COLOR, c); 
+   } 
+}
+
+void CreateDashboard() {
+   int x=InpStartX, y=InpStartY, s=InpRowStep, col=InpColumnX;
+   CreateLabel("Title", ">>GOGOR V1.55 PRO<<", x, y, InpMainColor, 11, "Arial Black"); y+=36;
+   
+   CreateLabel("CatHlt", "CORE MONITORING", x, y, InpMainColor, 9, "Arial Bold"); 
+   CreateLabel("ValTime", ": 00:00:00", x+col, y+s, clrAqua, 9);
+   CreateLabel("LblTime", "S Time", x, y+s, clrWhite, 9); 
+   CreateLabel("ValStat", ": Active", x+col, y+(s*2), clrLime, 9); CreateLabel("LblStat", "Status", x, y+(s*2), clrWhite, 9);
+   CreateLabel("ValExp", ": 00.00.00 (0 hari)", x+col, y+(s*3), clrYellow, 9); CreateLabel("LblExp", "Expiry", x, y+(s*3), clrWhite, 9);
+   CreateLabel("ValErr", ": System OK", x+col, y+(s*4), clrGray, 8); CreateLabel("LblErr", "Check", x, y+(s*4), clrWhite, 9);
+   CreateLabel("ValActive", ": 0", x+col, y+(s*5), clrYellow, 9); CreateLabel("LblActive", "P. aktif", x, y+(s*5), clrWhite, 9); 
+   
+   y+=(int)(s*6.5);
+   CreateLabel("Cat1", "ACCOUNT METRICS", x, y, InpMainColor, 9, "Arial Bold"); 
+   CreateLabel("ValDaily", ": 0.00 USD", x+col, y+s, InpValColor, 9);
+   CreateLabel("LblDaily", "Daily P/L", x, y+s, clrWhite, 9); 
+   CreateLabel("ValWR", ": 0.0 %", x+col, y+(s*2), InpValColor, 9);
+   CreateLabel("LblWR", "WR/D", x, y+(s*2), clrWhite, 9); 
+   CreateLabel("ValBal", ": 0.00", x+col, y+(s*3), InpValColor, 9); CreateLabel("LblBal", "Balance", x, y+(s*3), clrWhite, 9);
+   CreateLabel("ValEqt", ": 0.00", x+col, y+(s*4), InpValColor, 9); CreateLabel("LblEqt", "Equity", x, y+(s*4), clrWhite, 9);
+   
+   y+=(int)(s*5.5);
+   CreateLabel("CatStrat", "EMA METRICS", x, y, InpMainColor, 9, "Arial Bold");
+   CreateLabel("ValEMAStat", ": WAITING", x+col, y+s, clrYellow, 9);
+   CreateLabel("LblEMAStat", "EMA State", x, y+s, clrWhite, 9);
+   CreateLabel("ValFastEMA", ": 0.00000", x+col, y+(s*2), clrAqua, 9);
+   CreateLabel("LblFastEMA", "EMA F", x, y+(s*2), clrWhite, 9);
+   CreateLabel("ValSlowEMA", ": 0.00000", x+col, y+(s*3), clrYellow, 9);
+   CreateLabel("LblSlowEMA", "EMA S", x, y+(s*3), clrWhite, 9);
+
+   y+=(int)(s*4.5);
+   CreateLabel("CatSig", "LIVE MONITORING", x, y, InpMainColor, 9, "Arial Bold"); 
+   CreateLabel("ValBuyCount", ": 0", x+col, y+s, clrLime, 9);
+   CreateLabel("LblBuyCount", "Buy Pos", x, y+s, clrWhite, 9); 
+   CreateLabel("ValSellCount", ": 0", x+col, y+(s*2), clrRed, 9);
+   CreateLabel("LblSellCount", "Sell Pos", x, y+(s*2), clrWhite, 9); 
+   CreateLabel("ValSpread", ": 0", x+col, y+(s*3), clrAqua, 9); CreateLabel("LblSpread", "Spread", x, y+(s*3), clrWhite, 9);
+   
+   y+=(int)(s*4.5); 
+   CreateLabel("Cat2", "FLOATING P/L", x, y, InpMainColor, 9, "Arial Bold"); 
+   CreateLabel("ValPL", "0.00 USD", x, y+s, clrWhite, 14, "Impact");
+   
+   if(ObjectFind(0, prefix+"BtnClose") < 0) { 
+      ObjectCreate(0, prefix+"BtnClose", OBJ_BUTTON, 0, 0, 0);
+      ObjectSetInteger(0, prefix+"BtnClose", OBJPROP_XDISTANCE, x); ObjectSetInteger(0, prefix+"BtnClose", OBJPROP_YDISTANCE, (int)(y+(s*3.2)));
+      ObjectSetInteger(0, prefix+"BtnClose", OBJPROP_XSIZE, 395); ObjectSetInteger(0, prefix+"BtnClose", OBJPROP_YSIZE, 30);
+      ObjectSetString(0, prefix+"BtnClose", OBJPROP_TEXT, "CLOSE ALL");
+      ObjectSetInteger(0, prefix+"BtnClose", OBJPROP_BGCOLOR, clrFireBrick); ObjectSetInteger(0, prefix+"BtnClose", OBJPROP_COLOR, clrWhite);
+   }
+   
+   int btnY = (int)(y + (s*3.2) + 36);
+   int btnWidth = 130;
+   int btnHeight = 35;
+   
+   if(ObjectFind(0, prefix+"BtnModeAll") < 0) {
+      ObjectCreate(0, prefix+"BtnModeAll", OBJ_BUTTON, 0, 0, 0);
+      ObjectSetInteger(0, prefix+"BtnModeAll", OBJPROP_XDISTANCE, x); ObjectSetInteger(0, prefix+"BtnModeAll", OBJPROP_YDISTANCE, btnY);
+      ObjectSetInteger(0, prefix+"BtnModeAll", OBJPROP_XSIZE, btnWidth); ObjectSetInteger(0, prefix+"BtnModeAll", OBJPROP_YSIZE, btnHeight);
+      ObjectSetString(0, prefix+"BtnModeAll", OBJPROP_TEXT, "ALL");
+      ObjectSetInteger(0, prefix+"BtnModeAll", OBJPROP_FONTSIZE, 9);
+      ObjectSetString(0, prefix+"BtnModeAll", OBJPROP_FONT, "Arial Bold"); ObjectSetInteger(0, prefix+"BtnModeAll", OBJPROP_COLOR, clrWhite);
+   }
+   if(ObjectFind(0, prefix+"BtnModeBuy") < 0) {
+      ObjectCreate(0, prefix+"BtnModeBuy", OBJ_BUTTON, 0, 0, 0);
+      ObjectSetInteger(0, prefix+"BtnModeBuy", OBJPROP_XDISTANCE, x + btnWidth + 3); ObjectSetInteger(0, prefix+"BtnModeBuy", OBJPROP_YDISTANCE, btnY);
+      ObjectSetInteger(0, prefix+"BtnModeBuy", OBJPROP_XSIZE, btnWidth); ObjectSetInteger(0, prefix+"BtnModeBuy", OBJPROP_YSIZE, btnHeight);
+      ObjectSetString(0, prefix+"BtnModeBuy", OBJPROP_TEXT, "BUY"); ObjectSetInteger(0, prefix+"BtnModeBuy", OBJPROP_FONTSIZE, 9);
+      ObjectSetString(0, prefix+"BtnModeBuy", OBJPROP_FONT, "Arial Bold"); ObjectSetInteger(0, prefix+"BtnModeBuy", OBJPROP_COLOR, clrWhite);
+   }
+   if(ObjectFind(0, prefix+"BtnModeSell") < 0) {
+      ObjectCreate(0, prefix+"BtnModeSell", OBJ_BUTTON, 0, 0, 0);
+      ObjectSetInteger(0, prefix+"BtnModeSell", OBJPROP_XDISTANCE, x + (btnWidth * 2) + 6); ObjectSetInteger(0, prefix+"BtnModeSell", OBJPROP_YDISTANCE, btnY);
+      ObjectSetInteger(0, prefix+"BtnModeSell", OBJPROP_XSIZE, btnWidth - 5);
+      ObjectSetInteger(0, prefix+"BtnModeSell", OBJPROP_YSIZE, btnHeight);
+      ObjectSetString(0, prefix+"BtnModeSell", OBJPROP_TEXT, "SELL"); ObjectSetInteger(0, prefix+"BtnModeSell", OBJPROP_FONTSIZE, 9);
+      ObjectSetString(0, prefix+"BtnModeSell", OBJPROP_FONT, "Arial Bold");
+      ObjectSetInteger(0, prefix+"BtnModeSell", OBJPROP_COLOR, clrWhite);
+   }
+}
+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam) {
+   if(id == CHARTEVENT_OBJECT_CLICK && sparam == prefix+"BtnClose") { 
+      g_LastErrorMessage = "Action: Force Closing All...";
+      for(int i = PositionsTotal()-1; i >= 0; i--) {
+         if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber) {
+            trade.PositionClose(posInfo.Ticket());
+         }
+      }
+      ObjectSetInteger(0, prefix+"BtnClose", OBJPROP_STATE, false); 
+      PurgeMQL5CacheAndLogs();
+   }
+   
+   if(id == CHARTEVENT_OBJECT_CLICK) {
+      if(sparam == prefix+"BtnModeAll") {
+         g_EAMode = MODE_ALL;
+         g_LastErrorMessage = "Mode Set: All Strategies Enabled";
+         ObjectSetInteger(0, prefix+"BtnModeAll", OBJPROP_STATE, false); 
+         UpdateDashboard(); 
+      }
+      else if(spArgsIsBtnBuy(sparam)) {
+         g_EAMode = MODE_BUY_ONLY;
+         g_LastErrorMessage = "Mode Set: Buy Only";
+         ObjectSetInteger(0, prefix+"BtnModeBuy", OBJPROP_STATE, false); 
+         UpdateDashboard(); 
+      }
+      else if(sparam == prefix+"BtnModeSell") {
+         g_EAMode = MODE_SELL_ONLY;
+         g_LastErrorMessage = "Mode Set: Sell Only";
+         ObjectSetInteger(0, prefix+"BtnModeSell", OBJPROP_STATE, false); 
+         UpdateDashboard(); 
+      }
+   }
+}
+
+bool spArgsIsBtnBuy(string sparam) {
+   return (sparam == prefix+"BtnModeBuy");
+}
